@@ -114,12 +114,63 @@ def run_review(args):
         else:
             user_prompt += "\n(The acceptance criteria are likely embedded within or implied by the user story. Please infer them as best as possible.)\n"
 
-        user_prompt += f"""
-        **Source Code:**
-        The complete source code for the project/feature is provided in the uploaded ZIP file.
-        File Name on Server (Resource Name): {uploaded.name}
-        Display Name: {Path(args.zip).name}
-        URI for Model Access: {uploaded.uri}
+        # choose which review prompt block to append
+        if args.known_incomplete:
+            # In-progress review prompt
+            user_prompt += f"""
+**Source Code (In-Progress):**
+The current in-progress source code for the project/feature is provided in the uploaded ZIP file.
+File Name on Server (Resource Name): {uploaded.name}
+Display Name: {Path(args.zip).name}
+URI for Model Access: {uploaded.uri}
+
+**Review Focus (In-Progress Work):**
+This review is for work that is **not yet complete**. The primary goals are:
+1. To assess if the current direction aligns with the ticket's objectives and architectural goals.
+2. To identify any potential deviations or roadblocks early.
+3. To provide constructive feedback to keep the development on track.
+
+**Your Task:**
+1. Analyze the current state of the source code accessible via the provided file URI.
+2. Evaluate the implemented portions against the relevant acceptance criteria and user story goals (understanding they may not all be met yet).
+3. Identify areas where the current implementation is **well-aligned** with the intended architecture and goals.
+4. Identify any **potential deviations, risks, or areas needing course correction** to meet the final goals.
+5. Offer feedback on code quality and potential improvements, focusing on guiding the ongoing work.
+
+**Output Format (In-Progress Review):**
+Provide a structured feedback report:
+
+1.  **Overall Progress Assessment:**
+    *   **Current Direction:** `[e.g., "On Track with Ticket Goals", "Generally Aligned, Minor Adjustments Suggested", "Potential Misalignment, Course Correction Recommended"]`
+    *   **Summary:** `[Provide a 1-2 sentence high-level summary of the current progress and alignment.]`
+
+2.  **Areas of Strong Alignment / Positive Progress:**
+    *   `[List specific aspects of the current implementation that are progressing well and align with the ticket's goals or architectural principles. e.g., "The new Bar interface in @foo/something is well-structured and generic as intended."]`
+
+3.  **Areas for Attention / Potential Course Correction (Constructive Feedback):**
+    *   *(For each area needing attention):*
+        *   **Observation/Concern:** `[Brief description of the observation or potential issue.]`
+        *   **Reference (Intended Goal):** `[Link to relevant User Story/Ticket ID, Acceptance Criterion #, or architectural goal this observation relates to.]`
+        *   **Code Evidence (Current State):** `[Cite specific file(s) and line number(s) if applicable.]`
+        *   **Suggestion/Guidance:** `[Provide constructive advice or questions to guide the developer. Focus on keeping them on track rather than just pointing out incompleteness. e.g., "Consider moving the FooModel to the @bar/models directory to maintain package cohesion as per Ticket C*.", "Ensure that the circular dependency between X and Y is addressed before this component is finalized by removing import Z."]`
+
+4.  **Key Considerations for Next Steps (Guidance, not Demands for Completion):**
+    *   `[Highlight 1-3 critical aspects the developer should focus on next to ensure the work stays aligned with the ticket's ultimate goals. e.g., "Prioritize removing all text-specific exports from @foo/something.", "Focus on ensuring the \`move\` operation for model files is atomic in the next iteration."]`
+
+5.  **General Code Quality Feedback (Optional, if noteworthy at this stage):**
+    *   `[Brief comments on code style, clarity, or potential refactoring opportunities that can be incorporated as development continues.]`
+
+**Concluding Remark:**
+*   `[A brief, encouraging closing statement, reiterating the focus on guidance for ongoing work.]`
+"""
+        else:
+            # Default (known-incomplete not set) – standard review prompt
+            user_prompt += f"""
+**Source Code:**
+The complete source code for the project/feature is provided in the uploaded ZIP file.
+File Name on Server (Resource Name): {uploaded.name}
+Display Name: {Path(args.zip).name}
+URI for Model Access: {uploaded.uri}
 
         **Your Task:**
         1. Thoroughly analyze the source code accessible via the provided file URI.
@@ -217,6 +268,11 @@ def main():
         "--cleanup-files",
         action="store_true",
         help="Delete all uploaded files from Vertex AI, then list what's left"
+    )
+    parser.add_argument(
+        "--known-incomplete",
+        action="store_true",
+        help="Use the in-progress review prompt instead of the default full-review prompt"
     )
     parser.add_argument("--version", action="version", version="1.0.0")
 
