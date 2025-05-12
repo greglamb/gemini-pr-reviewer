@@ -9,18 +9,63 @@ Use --list-files to see stored files without doing anything else.
 Use --cleanup-files to delete all stored files and then list what's left.
 
 Example usage:
-    # Normal review run, write to feedback.md only:
-    python pr_review.py -z project.zip -s user_story.txt -c acceptance_criteria.txt -o feedback.md
+    # Review run with a custom prompt, write to feedback.md:
+    python pr_review.py -z project.zip -s user_story.txt -c acceptance_criteria.txt -p prompt.txt -o feedback.md
+
+    # Multiple zip files:
+    python pr_review.py -z project1.zip project2.zip -s user_story.txt -c acceptance_criteria.txt -p prompt.txt -o feedback.md
+
+    # For multiple zip files in a custom prompt, you can use these placeholder formats:
+    # - {ZIP_FILES_LIST} - Lists all files with their details in a formatted block
+    # - {FILE_NAME_1}, {DISPLAY_NAME_1}, {FILE_URI_1} - For the first zip file
+    # - {FILE_NAME_2}, {DISPLAY_NAME_2}, {FILE_URI_2} - For the second zip file, etc.
+    # - {FILE_NAME}, {DISPLAY_NAME}, {FILE_URI} - For backward compatibility (uses first file)
+    # 
+    # The user story and acceptance criteria will be automatically appended after your prompt.
+    # If you want to include them in a specific location, you can use these placeholders:
+    # - {USER_STORY} - The content of the user story file
+    # - {ACCEPTANCE_CRITERIA} - The content of the acceptance criteria file (if provided)
 
     # Same, but also show feedback in console:
-    python pr_review.py -z project.zip -s user_story.txt -c acceptance_criteria.txt \
+    python pr_review.py -z project.zip -s user_story.txt -c acceptance_criteria.txt -p prompt.txt \
         -o feedback.md --show-feedback
+
+    # Show the full prompt sent to the AI (for debugging):
+    python pr_review.py -z project.zip -s user_story.txt -c acceptance_criteria.txt -p prompt.txt \
+        -o feedback.md --show-prompt
+
+    # Save the full prompt to a file (for debugging):
+    python pr_review.py -z project.zip -s user_story.txt -c acceptance_criteria.txt -p prompt.txt \
+        -o feedback.md --save-prompt=prompt_debug.txt
+        
+    # Keep the uploaded files in Vertex AI (don't automatically clean up):
+    python pr_review.py -z project.zip -s user_story.txt -c acceptance_criteria.txt -p prompt.txt \
+        -o feedback.md --keep-files
 
     # Just list files without deleting or reviewing:
     python pr_review.py --list-files
 
     # Delete all stored files, then list what's left:
     python pr_review.py --cleanup-files
+    
+    # Example prompt file content:
+    # ------------------------------
+    # **Source Code:**
+    # The complete source code for the project/feature is provided in the uploaded ZIP file(s).
+    # {ZIP_FILES_LIST}
+    # 
+    # **Before and After**
+    # - before.zip contains the complete source code before work began on this user story.
+    # - after.zip contains the complete source code after work was allegedly completed on this user story.
+    # - Please help me determine if this pull request is ready to be merged, and this user story is ready to be closed.
+    # 
+    # **Your Task:**
+    # 1. Thoroughly analyze the source code accessible via the provided file URI(s).
+    # 2. Verify if all stated acceptance criteria have been met.
+    # 3. Verify if all changes requested in the user story have been successfully implemented.
+    # 4. Identify any deviations, bugs, or areas where the implementation does not align.
+    # 5. Comment on code quality and potential improvements, prioritizing verification of completion.
+    # ------------------------------
 """
 
 from dotenv import load_dotenv
@@ -75,10 +120,12 @@ def upload_and_process_file(file_path):
     name = Path(file_path).name
     print(f"Uploading {name} …")
     uploaded = genai.upload_file(file_path)
+
     while uploaded.state.name == "PROCESSING":
         print(f"  {name} state={uploaded.state.name}; retrying in 5s …")
         time.sleep(5)
         uploaded = genai.get_file(name=uploaded.name)
+
     if uploaded.state.name == "FAILED":
         raise Exception("Upload failed (state=FAILED)")
     print(f"  {name} is ACTIVE (URI: {uploaded.uri})")
@@ -91,137 +138,131 @@ def read_text_file_content(path):
 
 
 def run_review(args):
-    uploaded = None
+    uploaded_files = []
+    file_display_names = {}  # Dictionary to track display names
     try:
-        if not Path(args.zip).exists():
-            raise FileNotFoundError(f"ZIP not found: {args.zip}")
+        # Validate input files
+        for zip_path in args.zip:
+            if not Path(zip_path).exists():
+                raise FileNotFoundError(f"ZIP not found: {zip_path}")
+
         if not Path(args.story).exists():
             raise FileNotFoundError(f"Story not found: {args.story}")
+
         if args.criteria and not Path(args.criteria).exists():
             raise FileNotFoundError(f"Criteria not found: {args.criteria}")
 
-        uploaded = upload_and_process_file(args.zip)
+        if args.prompt and not Path(args.prompt).exists():
+            raise FileNotFoundError(f"Prompt not found: {args.prompt}")
 
+        # Upload all zip files
+        for zip_path in args.zip:
+            uploaded = upload_and_process_file(zip_path)
+            uploaded_files.append(uploaded)
+            # Store the original filename keyed by the file's name
+            file_display_names[uploaded.name] = Path(zip_path).name
+
+        # Read the story and criteria
         story = read_text_file_content(args.story)
         criteria = read_text_file_content(args.criteria) if args.criteria else ""
+
         system_inst = (
             "You are an expert QA engineer and senior software developer."
-            "Your task is to meticulously review the provided source code (in the uploaded ZIP file) against the given user story and its acceptance criteria."
+            "Your task is to meticulously review the provided source code (in the uploaded ZIP file(s)) against the given user story and its acceptance criteria."
         )
-        user_prompt = f"**User Story:**\n{story}\n"
-        if criteria:
-            user_prompt += f"\n**Acceptance Criteria:**\n{criteria}\n"
-        else:
-            user_prompt += "\n(The acceptance criteria are likely embedded within or implied by the user story. Please infer them as best as possible.)\n"
 
-        # choose which review prompt block to append
-        if args.known_incomplete:
-            # In-progress review prompt
-            user_prompt += f"""
-**Source Code (In-Progress):**
-The current in-progress source code for the project/feature is provided in the uploaded ZIP file.
-File Name on Server (Resource Name): {uploaded.name}
-Display Name: {Path(args.zip).name}
-URI for Model Access: {uploaded.uri}
+        # Start with an empty prompt
+        user_prompt = ""
 
-**Review Focus (In-Progress Work):**
-This review is for work that is **not yet complete**. The primary goals are:
-1. To assess if the current direction aligns with the ticket's objectives and architectural goals.
-2. To identify any potential deviations or roadblocks early.
-3. To provide constructive feedback to keep the development on track.
+        # Load custom prompt from file
+        custom_prompt = read_text_file_content(args.prompt)
 
-**Your Task:**
-1. Analyze the current state of the source code accessible via the provided file URI.
-2. Evaluate the implemented portions against the relevant acceptance criteria and user story goals (understanding they may not all be met yet).
-3. Identify areas where the current implementation is **well-aligned** with the intended architecture and goals.
-4. Identify any **potential deviations, risks, or areas needing course correction** to meet the final goals.
-5. Offer feedback on code quality and potential improvements, focusing on guiding the ongoing work.
-
-**Output Format (In-Progress Review):**
-Provide a structured feedback report:
-
-1.  **Overall Progress Assessment:**
-    *   **Current Direction:** `[e.g., "On Track with Ticket Goals", "Generally Aligned, Minor Adjustments Suggested", "Potential Misalignment, Course Correction Recommended"]`
-    *   **Summary:** `[Provide a 1-2 sentence high-level summary of the current progress and alignment.]`
-
-2.  **Areas of Strong Alignment / Positive Progress:**
-    *   `[List specific aspects of the current implementation that are progressing well and align with the ticket's goals or architectural principles. e.g., "The new Bar interface in @foo/something is well-structured and generic as intended."]`
-
-3.  **Areas for Attention / Potential Course Correction (Constructive Feedback):**
-    *   *(For each area needing attention):*
-        *   **Observation/Concern:** `[Brief description of the observation or potential issue.]`
-        *   **Reference (Intended Goal):** `[Link to relevant User Story/Ticket ID, Acceptance Criterion #, or architectural goal this observation relates to.]`
-        *   **Code Evidence (Current State):** `[Cite specific file(s) and line number(s) if applicable.]`
-        *   **Suggestion/Guidance:** `[Provide constructive advice or questions to guide the developer. Focus on keeping them on track rather than just pointing out incompleteness. e.g., "Consider moving the FooModel to the @bar/models directory to maintain package cohesion as per Ticket C*.", "Ensure that the circular dependency between X and Y is addressed before this component is finalized by removing import Z."]`
-
-4.  **Key Considerations for Next Steps (Guidance, not Demands for Completion):**
-    *   `[Highlight 1-3 critical aspects the developer should focus on next to ensure the work stays aligned with the ticket's ultimate goals. e.g., "Prioritize removing all text-specific exports from @foo/something.", "Focus on ensuring the \`move\` operation for model files is atomic in the next iteration."]`
-
-5.  **General Code Quality Feedback (Optional, if noteworthy at this stage):**
-    *   `[Brief comments on code style, clarity, or potential refactoring opportunities that can be incorporated as development continues.]`
-
-**Concluding Remark:**
-*   `[A brief, encouraging closing statement, reiterating the focus on guidance for ongoing work.]`
+        # Check if we need to handle special placeholders for multiple files
+        if "{ZIP_FILES_LIST}" in custom_prompt:
+            # Create a formatted list of all zip files
+            zip_files_info = ""
+            for i, uploaded in enumerate(uploaded_files, 1):
+                display_name = file_display_names.get(uploaded.name, "Unknown")
+                zip_files_info += f"""
+ZIP File #{i}:
+  File Name on Server: {uploaded.name}
+  Display Name: {display_name}
+  URI for Model Access: {uploaded.uri}
 """
+            custom_prompt = custom_prompt.replace("{ZIP_FILES_LIST}", zip_files_info)
+            
+        # Handle user story and acceptance criteria placeholders
+        custom_prompt = custom_prompt.replace("{USER_STORY}", story)
+        if criteria:
+            custom_prompt = custom_prompt.replace("{ACCEPTANCE_CRITERIA}", criteria)
         else:
-            # Default (known-incomplete not set) – standard review prompt
-            user_prompt += f"""
-**Source Code:**
-The complete source code for the project/feature is provided in the uploaded ZIP file.
-File Name on Server (Resource Name): {uploaded.name}
-Display Name: {Path(args.zip).name}
-URI for Model Access: {uploaded.uri}
+            custom_prompt = custom_prompt.replace("{ACCEPTANCE_CRITERIA}", 
+                "(The acceptance criteria are likely embedded within or implied by the user story. Please infer them as best as possible.)")
+            
+        # Handle file-specific placeholders
+        for i, uploaded in enumerate(uploaded_files, 1):
+            display_name = file_display_names.get(uploaded.name, "Unknown")
 
-        **Your Task:**
-        1. Thoroughly analyze the source code accessible via the provided file URI.
-        2. Verify if all stated acceptance criteria have been met.
-        3. Verify if all changes requested in the user story have been successfully implemented.
-        4. Identify any deviations, bugs, or areas where the implementation does not align.
-        5. Comment on code quality and potential improvements, prioritizing verification of completion.
+            # Use indexed placeholders for multiple files
+            custom_prompt = custom_prompt.replace(f"{{FILE_NAME_{i}}}", uploaded.name)
+            custom_prompt = custom_prompt.replace(f"{{DISPLAY_NAME_{i}}}", display_name)
+            custom_prompt = custom_prompt.replace(f"{{FILE_URI_{i}}}", uploaded.uri)
 
-        **Output Format:**
-        Provide a structured feedback report:
+            # Also replace non-indexed placeholders with the first file (for backward compatibility)
+            if i == 1:
+                custom_prompt = custom_prompt.replace("{FILE_NAME}", uploaded.name)
+                custom_prompt = custom_prompt.replace("{DISPLAY_NAME}", display_name)
+                custom_prompt = custom_prompt.replace("{FILE_URI}", uploaded.uri)
 
-        1.  **Overall Assessment:**
-            *   **Status:** `[e.g., "Ticket Goals Met", "Ticket Partially Met", "Significant Issues Found - Not Met"]`
-            *   **Summary:** `[Provide a 1-2 sentence high-level summary of the review findings.]`
+        # Add custom prompt first
+        user_prompt += custom_prompt
+        
+        # Only append the user story if it's not already included through placeholders
+        if "{USER_STORY}" not in custom_prompt:
+            # Add a separator
+            user_prompt += "\n\n---\n\n"
+            
+            # Add user story after the custom prompt
+            user_prompt += f"**User Story Details:**\n{story}\n"
+            if criteria and "{ACCEPTANCE_CRITERIA}" not in custom_prompt:
+                user_prompt += f"\n**Acceptance Criteria:**\n{criteria}\n"
+            elif not criteria and "{ACCEPTANCE_CRITERIA}" not in custom_prompt:
+                user_prompt += "\n(The acceptance criteria are likely embedded within or implied by the user story. Please infer them as best as possible.)\n"
 
-        2.  **Detailed Findings (if any discrepancies):**
-            *   *(For each issue/discrepancy found):*
-                *   **Issue:** `[Brief description of the problem or deviation.]`
-                *   **Reference:** `[Link to relevant User Story/Ticket ID, Acceptance Criterion #, or specific architectural goal discussed previously.]`
-                *   **Code Evidence:** `[Cite specific file(s) and line number(s) where the issue is observed, if applicable. e.g., "In packages/foo/src/models/index.ts, Line X..."]`
-                *   **Impact:** `[Briefly explain the consequence of this issue, e.g., "This maintains the circular dependency," "This will cause build failures in downstream packages."] `
-
-        3.  **Positive Confirmations (if applicable):**
-            *   `[List any key criteria or goals that *were* successfully met, especially if the overall status isn't fully "Met". e.g., "The new Bar interface in @something/foo is correctly implemented."]`
-
-        4.  **Conclusion & Readiness for Next Steps:**
-            *   **Is the ticket complete as per its definition?** `[Yes/No/Partially]`
-            *   **Are we ready to proceed to Ticket(s) `[Next Ticket ID(s)]`?** `[Yes/No/No, requires addressing the following... ]`
-
-        5.  **Actionable Next Steps for Developer:**
-            *   `[Provide a clear, ordered list of specific actions the developer needs to take to resolve the identified issues and meet the ticket's goals. Be precise.]`
-                *   *Example 1:* "1. Remove the text-specific model files (`Foo.ts`, `Bar.ts`) from `packages/example/src/models/`."
-                *   *Example 2:* "2. Delete the import of `Bar` from `@foo/something` within `packages/example/src/models/index.ts`."
-                *   *Example 3:* "3. Ensure all unit tests in `@foo/something` pass after these changes."
-            *   *(If all criteria are met and no issues):* "No further action required for this ticket. Ready to proceed to Ticket `[Next Ticket ID]`."
-
-        """
+        # The user story was already added at the beginning of the prompt
+        # No need to add it again
 
         model = genai.GenerativeModel(
             model_name=MODEL_NAME,
-            generation_config=genai.GenerationConfig(temperature=0.3),
+            generation_config=genai.GenerationConfig(temperature=0.2),  # Lower temperature for more focused code reviews
             safety_settings=[
                 {"category": "HARM_CATEGORY_HARASSMENT",      "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH",      "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
                 {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT","threshold": "BLOCK_MEDIUM_AND_ABOVE"},
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT","threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            ]
+            ],
+            tools=[{
+                "function_declarations": [{"name": "execute_code", "description": "Execute code in a sandbox environment"}]
+            }],
         )
 
         print(f"\nSending request to {MODEL_NAME} …")
-        response = model.generate_content(f"{system_inst}\n\n{user_prompt}")
+
+        full_prompt = f"{system_inst}\n\n{user_prompt}"
+
+        # Show full prompt if requested
+        if args.show_prompt:
+            print("\n--- Full Prompt ---\n")
+            print(full_prompt)
+            print("\n--- End Full Prompt ---\n")
+
+        # Save prompt to file if requested
+        if args.save_prompt:
+            with open(args.save_prompt, 'w', encoding='utf-8') as prompt_file:
+                prompt_file.write(full_prompt)
+            print(f"Full prompt saved to: {args.save_prompt}")
+
+        response = model.generate_content(full_prompt)
         feedback = response.text
 
         if args.output:
@@ -238,11 +279,18 @@ URI for Model Access: {uploaded.uri}
         print(f"\nError: {e}")
         sys.exit(1)
     finally:
-        if uploaded:
-            try:
-                genai.delete_file(name=uploaded.name)
-            except Exception:
-                pass
+        # Clean up all uploaded files unless --keep-files is specified
+        if not args.keep_files:
+            for uploaded in uploaded_files:
+                try:
+                    display_name = file_display_names.get(uploaded.name, "Unknown")
+                    genai.delete_file(name=uploaded.name)
+                    print(f"Deleted {display_name}")
+                except Exception as e:
+                    print(f"Error deleting {display_name}: {e}")
+        else:
+            print("Keeping uploaded files (--keep-files specified)")
+        
         list_stored_files()
 
 
@@ -250,14 +298,25 @@ def main():
     parser = argparse.ArgumentParser(
         description="Gemini PR Reviewer: analyze code or manage stored files, always list remaining."
     )
-    parser.add_argument("-z", "--zip",      help="Path to project ZIP file")
-    parser.add_argument("-s", "--story",    help="Path to user story text file")
+    parser.add_argument("-z", "--zip",      help="Path to project ZIP file(s)", nargs='+', required=True)
+    parser.add_argument("-s", "--story",    help="Path to user story text file", required=True)
     parser.add_argument("-c", "--criteria", help="Path to acceptance criteria text file")
+    parser.add_argument("-p", "--prompt",   help="Path to custom user prompt text file", required=True)
     parser.add_argument("-o", "--output",   help="Path to save feedback markdown")
     parser.add_argument(
         "--show-feedback",
         action="store_true",
         help="Also print Gemini feedback to the console (default: write only to file)"
+    )
+    parser.add_argument(
+        "--show-prompt",
+        action="store_true",
+        help="Print the full prompt sent to the AI endpoint (for debugging)"
+    )
+    parser.add_argument(
+        "--save-prompt",
+        metavar="FILE",
+        help="Save the full prompt to a file (for debugging)"
     )
     parser.add_argument(
         "--list-files",
@@ -270,9 +329,9 @@ def main():
         help="Delete all uploaded files from Vertex AI, then list what's left"
     )
     parser.add_argument(
-        "--known-incomplete",
+        "--keep-files",
         action="store_true",
-        help="Use the in-progress review prompt instead of the default full-review prompt"
+        help="Keep the uploaded files in Vertex AI (don't automatically clean up)"
     )
     parser.add_argument("--version", action="version", version="1.0.0")
 
@@ -290,12 +349,18 @@ def main():
     if not (args.zip and args.story):
         parser.error("for review you must provide -z/--zip and -s/--story")
 
-    args.zip     = str(Path(args.zip).resolve())
-    args.story   = str(Path(args.story).resolve())
+    # Resolve paths to absolute paths
+    args.zip = [str(Path(z).resolve()) for z in args.zip]
+    args.story = str(Path(args.story).resolve())
+
     if args.criteria:
         args.criteria = str(Path(args.criteria).resolve())
+    if args.prompt:
+        args.prompt = str(Path(args.prompt).resolve())
     if args.output:
-        args.output   = str(Path(args.output).resolve())
+        args.output = str(Path(args.output).resolve())
+    if args.save_prompt:
+        args.save_prompt = str(Path(args.save_prompt).resolve())
 
     run_review(args)
 
