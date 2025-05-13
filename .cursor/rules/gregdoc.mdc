@@ -1,0 +1,10 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+- Use the Google Developer Style Guide as your primary reference for overall documentation tone, style, and structure.
+- Use Google’s Engineering Practices Documentation for guidelines on how to write and review code, best practices for code comments, and other engineering documentation practices.
+- Use Google’s Open Source Documentation Guidelines for best practices for creating clear and effective documentation.
+- Use Mermaid’s Official Documentation to ensure your diagrams are clear and effectively convey your architecture.
+- Use CommonMark Markdown Guide for consistent and correct Markdown formatting.
