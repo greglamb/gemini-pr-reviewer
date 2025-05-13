@@ -44,6 +44,71 @@ A powerful CLI tool that leverages Google's Gemini AI to automate pull request r
 
 ## Usage
 
+### Primary Use Case: Before/After Comparison
+
+The most common use case is comparing code before and after changes to verify pull request completeness:
+
+```bash
+python pr_review.py \
+  -z before.zip after.zip \
+  -s story.txt \
+  -p prompt.md \
+  -o feedback.md
+```
+
+This use case is ideal for:
+- Verifying pull request completeness
+- Comparing code changes against user stories
+- Ensuring all acceptance criteria are met
+- Identifying potential issues or improvements
+
+### Sample Prompt Template
+
+The tool comes with a sample prompt template (`prompt.md`) that provides a structured format for code reviews:
+
+```
+**Source Code:**
+The complete source code for the project/feature is provided in the uploaded ZIP files:
+
+{ZIP_FILES_LIST}
+
+**Before and After**
+- before.zip contains the complete source code before work began on this user story.
+- after.zip contains the complete source code after work was allegedly completed on this user story.
+- Please help me determine if this pull request is ready to be merged, and this user story is ready to be closed.
+
+**Your Task:**
+1. Thoroughly analyze the source code accessible via the provided file URI(s).
+2. Verify if all stated acceptance criteria have been met.
+3. Verify if all changes requested in the user story have been successfully implemented.
+4. Identify any deviations, bugs, or areas where the implementation does not align.
+5. Comment on code quality and potential improvements, prioritizing verification of completion.
+
+**Output Format:**
+Provide a structured feedback report:
+
+1. **Overall Assessment:**
+   * **Status:** [e.g., "Ticket Goals Met", "Ticket Partially Met", "Significant Issues Found - Not Met"]
+   * **Summary:** [Provide a 1-2 sentence high-level summary of the review findings.]
+
+2. **Detailed Findings (if any discrepancies):**
+   * [For each issue/discrepancy found]
+   * **Issue:** [Brief description of the problem or deviation]
+   * **Reference:** [Link to relevant User Story/Ticket ID or Acceptance Criterion]
+   * **Code Evidence:** [Cite specific file(s) and line number(s)]
+   * **Impact:** [Briefly explain the consequence of this issue]
+
+3. **Positive Confirmations:**
+   * [List any key criteria or goals that were successfully met]
+
+4. **Conclusion & Readiness:**
+   * **Is the ticket complete as per its definition?** [Yes/No/Partially]
+   * **Are we ready to proceed to next steps?** [Yes/No/No, requires addressing...]
+
+5. **Actionable Next Steps:**
+   * [Provide a clear, ordered list of specific actions needed]
+```
+
 ### Basic Review
 
 ```bash
