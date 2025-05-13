@@ -68,154 +68,196 @@ Example usage:
     # ------------------------------
 """
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import sys
 import time
 import argparse
 from pathlib import Path
+from typing import List, Dict, Optional, Any
 
-import google.generativeai as genai
-from google.api_core.exceptions import GoogleAPIError
 import pkg_resources
+from dotenv import load_dotenv
 
-print(f"Using google-generativeai version: {pkg_resources.get_distribution('google-generativeai').version}")
+# Load environment variables from .env file
+load_dotenv()
 
-MODEL_NAME = "gemini-2.5-pro-preview-05-06"
-API_KEY = os.getenv("GEMINI_API_KEY")
-if not API_KEY:
-    print("Error: GEMINI_API_KEY not found in environment variables.")
+# Configure Gemini API
+try:
+    import google.generativeai as genai
+    from google.api_core.exceptions import GoogleAPIError
+    print(f"Using google-generativeai version: {pkg_resources.get_distribution('google-generativeai').version}")
+except ImportError as e:
+    print(f"Error: Required package not found: {e}")
+    print("Please install required packages with: pip install google-generativeai python-dotenv")
     sys.exit(1)
-genai.configure(api_key=API_KEY)
+
+# Constants
+MODEL_NAME = "gemini-2.5-pro-preview-05-06"
+MAX_FILE_SIZE_MB = 10
+MAX_ZIP_SIZE_MB = 50
+MAX_UPLOAD_RETRIES = 12
+UPLOAD_RETRY_DELAY_SEC = 5
 
 
-def list_stored_files():
-    print("\nCurrently stored files in Vertex AI:")
-    try:
-        files = list(genai.list_files())
-        if not files:
-            print("  (none)")
-            return
-        for f in files:
-            print(f"  • {f.name} (state={f.state.name})")
-    except Exception as e:
-        print(f"Error listing files: {e}")
-
-
-def cleanup_stored_files():
-    print("Cleaning up all stored files …")
-    try:
-        files = list(genai.list_files())
-        for f in files:
-            genai.delete_file(name=f.name)
-        print(f"  Deleted {len(files)} file{'s' if len(files)!=1 else ''}.")
-    except Exception as e:
-        print(f"Error during cleanup: {e}")
-        sys.exit(1)
-
-
-def upload_and_process_file(file_path):
-    name = Path(file_path).name
-    print(f"Uploading {name} …")
-    uploaded = genai.upload_file(file_path)
-
-    while uploaded.state.name == "PROCESSING":
-        print(f"  {name} state={uploaded.state.name}; retrying in 5s …")
-        time.sleep(5)
-        uploaded = genai.get_file(name=uploaded.name)
-
-    if uploaded.state.name == "FAILED":
-        raise Exception("Upload failed (state=FAILED)")
-    print(f"  {name} is ACTIVE (URI: {uploaded.uri})")
-    return uploaded
-
-
-def read_text_file_content(path):
-    with open(path, 'r', encoding='utf-8') as f:
-        return f.read()
-
-
-def run_review(args):
-    uploaded_files = []
-    file_display_names = {}  # Dictionary to track display names
-    try:
-        # Validate input files
+class GeminiReviewer:
+    """Main class for handling PR reviews with Gemini AI"""
+    
+    def __init__(self):
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        if not self.api_key:
+            print("Error: GEMINI_API_KEY not found in environment variables.")
+            sys.exit(1)
+        genai.configure(api_key=self.api_key)
+        self.uploaded_files = []
+        self.file_display_names = {}
+    
+    def validate_api_key(self) -> bool:
+        """Validate the API key by making a simple API call"""
+        try:
+            genai.list_models()
+            return True
+        except Exception as e:
+            print(f"Error: Invalid API key or API access issue: {e}")
+            return False
+    
+    def list_stored_files(self) -> None:
+        """List all files currently stored in Vertex AI"""
+        print("\nCurrently stored files in Vertex AI:")
+        try:
+            files = list(genai.list_files())
+            if not files:
+                print("  (none)")
+                return
+            for f in files:
+                print(f"  • {f.name} (state={f.state.name})")
+        except Exception as e:
+            print(f"Error listing files: {e}")
+    
+    def cleanup_stored_files(self) -> None:
+        """Delete all files stored in Vertex AI"""
+        print("Cleaning up all stored files …")
+        try:
+            files = list(genai.list_files())
+            for f in files:
+                genai.delete_file(name=f.name)
+            print(f"  Deleted {len(files)} file{'s' if len(files)!=1 else ''}.")
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+            sys.exit(1)
+    
+    def validate_file_size(self, file_path: str, max_size_mb: int = MAX_FILE_SIZE_MB) -> None:
+        """Check if a file exceeds the maximum allowed size"""
+        size_mb = Path(file_path).stat().st_size / (1024 * 1024)
+        if size_mb > max_size_mb:
+            raise ValueError(f"File {file_path} is too large ({size_mb:.1f}MB). Maximum size is {max_size_mb}MB.")
+    
+    def validate_input_files(self, args: argparse.Namespace) -> None:
+        """Validate all input files exist and are within size limits"""
+        # Validate ZIP files
         for zip_path in args.zip:
             if not Path(zip_path).exists():
                 raise FileNotFoundError(f"ZIP not found: {zip_path}")
-
+            self.validate_file_size(zip_path, max_size_mb=MAX_ZIP_SIZE_MB)
+        
+        # Validate user story file
         if not Path(args.story).exists():
             raise FileNotFoundError(f"Story not found: {args.story}")
-
-        if args.criteria and not Path(args.criteria).exists():
-            raise FileNotFoundError(f"Criteria not found: {args.criteria}")
-
-        if args.prompt and not Path(args.prompt).exists():
-            raise FileNotFoundError(f"Prompt not found: {args.prompt}")
-
-        # Upload all zip files
-        for zip_path in args.zip:
-            uploaded = upload_and_process_file(zip_path)
-            uploaded_files.append(uploaded)
-            # Store the original filename keyed by the file's name
-            file_display_names[uploaded.name] = Path(zip_path).name
-
-        # Read the story and criteria
-        story = read_text_file_content(args.story)
-        criteria = read_text_file_content(args.criteria) if args.criteria else ""
-
+        self.validate_file_size(args.story)
+        
+        # Validate acceptance criteria file if provided
+        if args.criteria:
+            if not Path(args.criteria).exists():
+                raise FileNotFoundError(f"Criteria not found: {args.criteria}")
+            self.validate_file_size(args.criteria)
+        
+        # Validate custom prompt file if provided
+        if args.prompt:
+            if not Path(args.prompt).exists():
+                raise FileNotFoundError(f"Prompt not found: {args.prompt}")
+            self.validate_file_size(args.prompt)
+    
+    def read_text_file(self, path: str) -> str:
+        """Read content from a text file with proper error handling"""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                if not content.strip():
+                    raise ValueError(f"File is empty: {path}")
+                return content
+        except UnicodeDecodeError:
+            print(f"Error: File {path} contains invalid UTF-8 characters")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error reading file {path}: {e}")
+            sys.exit(1)
+    
+    def upload_file(self, file_path: str) -> Any:
+        """Upload a file to Vertex AI and wait for processing to complete"""
+        name = Path(file_path).name
+        print(f"Uploading {name} …")
+        
+        try:
+            uploaded = genai.upload_file(file_path)
+            retry_count = 0
+            
+            # Wait for file to be processed
+            while uploaded.state.name == "PROCESSING" and retry_count < MAX_UPLOAD_RETRIES:
+                print(f"  {name} state={uploaded.state.name}; retrying in {UPLOAD_RETRY_DELAY_SEC}s …")
+                time.sleep(UPLOAD_RETRY_DELAY_SEC)
+                uploaded = genai.get_file(name=uploaded.name)
+                retry_count += 1
+            
+            if uploaded.state.name == "PROCESSING":
+                raise Exception(f"Upload timed out after {MAX_UPLOAD_RETRIES} retries")
+            if uploaded.state.name == "FAILED":
+                raise Exception("Upload failed (state=FAILED)")
+            
+            print(f"  {name} is ACTIVE (URI: {uploaded.uri})")
+            return uploaded
+        except Exception as e:
+            print(f"Error uploading {name}: {e}")
+            raise
+    
+    def build_prompt(self, args: argparse.Namespace, uploaded_files: List[Any]) -> str:
+        """Build the complete prompt for the AI model"""
+        # Read input files
+        story = self.read_text_file(args.story)
+        criteria = self.read_text_file(args.criteria) if args.criteria else ""
+        custom_prompt = self.read_text_file(args.prompt) if args.prompt else ""
+        
+        # System instruction
         system_inst = (
-            "You are an expert QA engineer and senior software developer."
-            "Your task is to meticulously review the provided source code (in the uploaded ZIP file(s)) against the given user story and its acceptance criteria."
+            "You are an expert QA engineer and senior software developer. "
+            "Your task is to meticulously review the provided source code (in the uploaded ZIP file(s)) "
+            "against the given user story and its acceptance criteria."
         )
-
-        # Start with an empty prompt
+        
+        # Start with an empty user prompt
         user_prompt = ""
-
-        # Load custom prompt from file
-        custom_prompt = read_text_file_content(args.prompt)
-
-        # Check if we need to handle special placeholders for multiple files
-        if "{ZIP_FILES_LIST}" in custom_prompt:
-            # Create a formatted list of all zip files
-            zip_files_info = ""
-            for i, uploaded in enumerate(uploaded_files, 1):
-                display_name = file_display_names.get(uploaded.name, "Unknown")
-                zip_files_info += f"""
-ZIP File #{i}:
-  File Name on Server: {uploaded.name}
-  Display Name: {display_name}
-  URI for Model Access: {uploaded.uri}
-"""
-            custom_prompt = custom_prompt.replace("{ZIP_FILES_LIST}", zip_files_info)
+        
+        # Process custom prompt with placeholders
+        if custom_prompt:
+            # Handle ZIP_FILES_LIST placeholder
+            if "{ZIP_FILES_LIST}" in custom_prompt:
+                zip_files_info = self._format_zip_files_list(uploaded_files)
+                custom_prompt = custom_prompt.replace("{ZIP_FILES_LIST}", zip_files_info)
             
-        # Handle user story and acceptance criteria placeholders
-        custom_prompt = custom_prompt.replace("{USER_STORY}", story)
-        if criteria:
-            custom_prompt = custom_prompt.replace("{ACCEPTANCE_CRITERIA}", criteria)
-        else:
-            custom_prompt = custom_prompt.replace("{ACCEPTANCE_CRITERIA}", 
-                "(The acceptance criteria are likely embedded within or implied by the user story. Please infer them as best as possible.)")
+            # Handle user story and acceptance criteria placeholders
+            custom_prompt = custom_prompt.replace("{USER_STORY}", story)
+            if criteria:
+                custom_prompt = custom_prompt.replace("{ACCEPTANCE_CRITERIA}", criteria)
+            else:
+                custom_prompt = custom_prompt.replace(
+                    "{ACCEPTANCE_CRITERIA}",
+                    "(The acceptance criteria are likely embedded within or implied by the user story. "
+                    "Please infer them as best as possible.)"
+                )
             
-        # Handle file-specific placeholders
-        for i, uploaded in enumerate(uploaded_files, 1):
-            display_name = file_display_names.get(uploaded.name, "Unknown")
-
-            # Use indexed placeholders for multiple files
-            custom_prompt = custom_prompt.replace(f"{{FILE_NAME_{i}}}", uploaded.name)
-            custom_prompt = custom_prompt.replace(f"{{DISPLAY_NAME_{i}}}", display_name)
-            custom_prompt = custom_prompt.replace(f"{{FILE_URI_{i}}}", uploaded.uri)
-
-            # Also replace non-indexed placeholders with the first file (for backward compatibility)
-            if i == 1:
-                custom_prompt = custom_prompt.replace("{FILE_NAME}", uploaded.name)
-                custom_prompt = custom_prompt.replace("{DISPLAY_NAME}", display_name)
-                custom_prompt = custom_prompt.replace("{FILE_URI}", uploaded.uri)
-
-        # Add custom prompt first
-        user_prompt += custom_prompt
+            # Handle file-specific placeholders
+            custom_prompt = self._replace_file_placeholders(custom_prompt, uploaded_files)
+            
+            # Add custom prompt to user prompt
+            user_prompt += custom_prompt
         
         # Only append the user story if it's not already included through placeholders
         if "{USER_STORY}" not in custom_prompt:
@@ -227,82 +269,157 @@ ZIP File #{i}:
             if criteria and "{ACCEPTANCE_CRITERIA}" not in custom_prompt:
                 user_prompt += f"\n**Acceptance Criteria:**\n{criteria}\n"
             elif not criteria and "{ACCEPTANCE_CRITERIA}" not in custom_prompt:
-                user_prompt += "\n(The acceptance criteria are likely embedded within or implied by the user story. Please infer them as best as possible.)\n"
-
-        # The user story was already added at the beginning of the prompt
-        # No need to add it again
-
+                user_prompt += (
+                    "\n(The acceptance criteria are likely embedded within or implied by the user story. "
+                    "Please infer them as best as possible.)\n"
+                )
+        
+        return f"{system_inst}\n\n{user_prompt}"
+    
+    def _format_zip_files_list(self, uploaded_files: List[Any]) -> str:
+        """Format the list of ZIP files for the prompt"""
+        zip_files_info = ""
+        for i, uploaded in enumerate(uploaded_files, 1):
+            display_name = self.file_display_names.get(uploaded.name, "Unknown")
+            zip_files_info += f"""
+ZIP File #{i}:
+  File Name on Server: {uploaded.name}
+  Display Name: {display_name}
+  URI for Model Access: {uploaded.uri}
+"""
+        return zip_files_info
+    
+    def _replace_file_placeholders(self, prompt: str, uploaded_files: List[Any]) -> str:
+        """Replace file-specific placeholders in the prompt"""
+        for i, uploaded in enumerate(uploaded_files, 1):
+            display_name = self.file_display_names.get(uploaded.name, "Unknown")
+            
+            # Use indexed placeholders for multiple files
+            prompt = prompt.replace(f"{{FILE_NAME_{i}}}", uploaded.name)
+            prompt = prompt.replace(f"{{DISPLAY_NAME_{i}}}", display_name)
+            prompt = prompt.replace(f"{{FILE_URI_{i}}}", uploaded.uri)
+            
+            # Also replace non-indexed placeholders with the first file (for backward compatibility)
+            if i == 1:
+                prompt = prompt.replace("{FILE_NAME}", uploaded.name)
+                prompt = prompt.replace("{DISPLAY_NAME}", display_name)
+                prompt = prompt.replace("{FILE_URI}", uploaded.uri)
+        
+        return prompt
+    
+    def generate_review(self, prompt: str) -> str:
+        """Generate a review using the Gemini AI model"""
         model = genai.GenerativeModel(
             model_name=MODEL_NAME,
             generation_config=genai.GenerationConfig(temperature=0.2),  # Lower temperature for more focused code reviews
             safety_settings=[
-                {"category": "HARM_CATEGORY_HARASSMENT",      "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_HARASSMENT",       "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH",      "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT","threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT","threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            ],
-            tools=[{
-                "function_declarations": [{"name": "execute_code", "description": "Execute code in a sandbox environment"}]
-            }],
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            ]
         )
-
-        print(f"\nSending request to {MODEL_NAME} …")
-
-        full_prompt = f"{system_inst}\n\n{user_prompt}"
-
-        # Show full prompt if requested
-        if args.show_prompt:
-            print("\n--- Full Prompt ---\n")
-            print(full_prompt)
-            print("\n--- End Full Prompt ---\n")
-
-        # Save prompt to file if requested
-        if args.save_prompt:
-            with open(args.save_prompt, 'w', encoding='utf-8') as prompt_file:
-                prompt_file.write(full_prompt)
-            print(f"Full prompt saved to: {args.save_prompt}")
-
-        response = model.generate_content(full_prompt)
-        feedback = response.text
-
-        if args.output:
-            with open(args.output, 'w', encoding='utf-8') as out:
-                out.write(feedback)
-            print(f"\nFeedback saved to: {args.output}")
-
-        if args.show_feedback:
-            print("\n--- Feedback ---\n")
-            print(feedback)
-            print("\n--- End Feedback ---")
-
-    except Exception as e:
-        print(f"\nError: {e}")
-        sys.exit(1)
-    finally:
-        # Clean up all uploaded files unless --keep-files is specified
-        if not args.keep_files:
-            for uploaded in uploaded_files:
-                try:
-                    display_name = file_display_names.get(uploaded.name, "Unknown")
-                    genai.delete_file(name=uploaded.name)
-                    print(f"Deleted {display_name}")
-                except Exception as e:
-                    print(f"Error deleting {display_name}: {e}")
-        else:
-            print("Keeping uploaded files (--keep-files specified)")
         
-        list_stored_files()
+        print(f"\nSending request to {MODEL_NAME} …")
+        
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            print(f"Error generating review: {e}")
+            raise
+    
+    def save_feedback(self, feedback: str, output_path: str) -> None:
+        """Save feedback to a file"""
+        try:
+            with open(output_path, 'w', encoding='utf-8') as out:
+                out.write(feedback)
+            print(f"\nFeedback saved to: {output_path}")
+        except Exception as e:
+            print(f"Error saving feedback: {e}")
+            raise
+    
+    def cleanup_uploaded_files(self) -> None:
+        """Delete all uploaded files"""
+        for uploaded in self.uploaded_files:
+            try:
+                display_name = self.file_display_names.get(uploaded.name, "Unknown")
+                genai.delete_file(name=uploaded.name)
+                print(f"Deleted {display_name}")
+            except Exception as e:
+                print(f"Error deleting {display_name}: {e}")
+    
+    def run_review(self, args: argparse.Namespace) -> None:
+        """Run the complete review process"""
+        try:
+            # Validate API key
+            if not self.validate_api_key():
+                sys.exit(1)
+            
+            # Validate input files
+            self.validate_input_files(args)
+            
+            # Upload all ZIP files
+            for zip_path in args.zip:
+                uploaded = self.upload_file(zip_path)
+                self.uploaded_files.append(uploaded)
+                self.file_display_names[uploaded.name] = Path(zip_path).name
+            
+            # Build the prompt
+            full_prompt = self.build_prompt(args, self.uploaded_files)
+            
+            # Show or save prompt if requested
+            if args.show_prompt:
+                print("\n--- Full Prompt ---\n")
+                print(full_prompt)
+                print("\n--- End Full Prompt ---\n")
+            
+            if args.save_prompt:
+                with open(args.save_prompt, 'w', encoding='utf-8') as prompt_file:
+                    prompt_file.write(full_prompt)
+                print(f"Full prompt saved to: {args.save_prompt}")
+            
+            # Generate review
+            feedback = self.generate_review(full_prompt)
+            
+            # Save feedback to file if output path is provided
+            if args.output:
+                self.save_feedback(feedback, args.output)
+            
+            # Show feedback if requested
+            if args.show_feedback:
+                print("\n--- Feedback ---\n")
+                print(feedback)
+                print("\n--- End Feedback ---")
+            
+        except Exception as e:
+            print(f"\nError: {e}")
+            sys.exit(1)
+        finally:
+            # Clean up uploaded files unless --keep-files is specified
+            if not args.keep_files:
+                self.cleanup_uploaded_files()
+            else:
+                print("Keeping uploaded files (--keep-files specified)")
+            
+            # Always list remaining files
+            self.list_stored_files()
 
 
-def main():
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser(
         description="Gemini PR Reviewer: analyze code or manage stored files, always list remaining."
     )
-    parser.add_argument("-z", "--zip",      help="Path to project ZIP file(s)", nargs='+', required=True)
-    parser.add_argument("-s", "--story",    help="Path to user story text file", required=True)
+    
+    # File inputs
+    parser.add_argument("-z", "--zip",      help="Path to project ZIP file(s)", nargs='+')
+    parser.add_argument("-s", "--story",    help="Path to user story text file")
     parser.add_argument("-c", "--criteria", help="Path to acceptance criteria text file")
-    parser.add_argument("-p", "--prompt",   help="Path to custom user prompt text file", required=True)
+    parser.add_argument("-p", "--prompt",   help="Path to custom user prompt text file")
     parser.add_argument("-o", "--output",   help="Path to save feedback markdown")
+    
+    # Display options
     parser.add_argument(
         "--show-feedback",
         action="store_true",
@@ -318,6 +435,8 @@ def main():
         metavar="FILE",
         help="Save the full prompt to a file (for debugging)"
     )
+    
+    # File management options
     parser.add_argument(
         "--list-files",
         action="store_true",
@@ -333,26 +452,21 @@ def main():
         action="store_true",
         help="Keep the uploaded files in Vertex AI (don't automatically clean up)"
     )
+    
+    # Version info
     parser.add_argument("--version", action="version", version="1.0.0")
-
+    
     args = parser.parse_args()
-
-    if args.list_files:
-        list_stored_files()
-        sys.exit(0)
-
-    if args.cleanup_files:
-        cleanup_stored_files()
-        list_stored_files()
-        sys.exit(0)
-
-    if not (args.zip and args.story):
-        parser.error("for review you must provide -z/--zip and -s/--story")
-
+    
+    # Validate arguments
+    if not (args.list_files or args.cleanup_files) and not (args.zip and args.story and args.prompt):
+        parser.error("For review you must provide -z/--zip, -s/--story, and -p/--prompt")
+    
     # Resolve paths to absolute paths
-    args.zip = [str(Path(z).resolve()) for z in args.zip]
-    args.story = str(Path(args.story).resolve())
-
+    if args.zip:
+        args.zip = [str(Path(z).resolve()) for z in args.zip]
+    if args.story:
+        args.story = str(Path(args.story).resolve())
     if args.criteria:
         args.criteria = str(Path(args.criteria).resolve())
     if args.prompt:
@@ -361,8 +475,25 @@ def main():
         args.output = str(Path(args.output).resolve())
     if args.save_prompt:
         args.save_prompt = str(Path(args.save_prompt).resolve())
+    
+    return args
 
-    run_review(args)
+
+def main() -> None:
+    """Main entry point for the script"""
+    args = parse_arguments()
+    reviewer = GeminiReviewer()
+    
+    if args.list_files:
+        reviewer.list_stored_files()
+        sys.exit(0)
+    
+    if args.cleanup_files:
+        reviewer.cleanup_stored_files()
+        reviewer.list_stored_files()
+        sys.exit(0)
+    
+    reviewer.run_review(args)
 
 
 if __name__ == "__main__":
